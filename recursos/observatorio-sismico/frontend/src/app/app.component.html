@@ -1,0 +1,280 @@
+<main>
+  <!-- Encabezado Principal -->
+  <header>
+    <p class="eyebrow">BIG DATA · CONSOLIDACIÓN RA1</p>
+    <h1>Observatorio de Actividad Sísmica</h1>
+    <p class="subtitulo">Monitor en tiempo real con pipeline distribuido Kafka, PostgreSQL y análisis comparativo histórico.</p>
+  </header>
+
+  <!-- Barra de Estado del Sistema y Conectividad -->
+  <section class="estado-sistema" [class.conectado]="isConnected()" [class.desconectado]="!isConnected()" aria-live="polite">
+    <div class="estado-header">
+      <span class="indicador-led"></span>
+      <strong>{{ mode() }}</strong>
+      <span class="estado-msg">— {{ status() }}</span>
+    </div>
+    <div class="estado-detalles">
+      <span><b>Última consulta:</b> {{ lastRead() }}</span>
+      <span><b>Última ingesta USGS:</b> {{ lastIngestion() }}</span>
+      <span><b>Fronteras:</b> {{ countriesStatus() }}</span>
+    </div>
+  </section>
+
+  <!-- Barra de Filtros Interactivos -->
+  <section class="filtros-panel" aria-label="Filtros de búsqueda sísmica">
+    <div class="filtro-grupo">
+      <label for="filtro-horas">⏱️ Ventana Temporal:</label>
+      <select id="filtro-horas" (change)="onHorasChange($event)">
+        <option value="24" [selected]="filtroHoras() === 24">Últimas 24 horas</option>
+        <option value="12" [selected]="filtroHoras() === 12">Últimas 12 horas</option>
+        <option value="6" [selected]="filtroHoras() === 6">Últimas 6 horas</option>
+        <option value="1" [selected]="filtroHoras() === 1">Última 1 hora</option>
+      </select>
+    </div>
+
+    <div class="filtro-grupo">
+      <label for="filtro-mag">⚡ Magnitud Mínima:</label>
+      <select id="filtro-mag" (change)="onMinMagChange($event)">
+        <option value="">Todas las magnitudes</option>
+        <option value="2.0">≥ 2.0 (Leves)</option>
+        <option value="3.0">≥ 3.0 (Perceptibles)</option>
+        <option value="4.0">≥ 4.0 (Moderados - Comparación)</option>
+        <option value="5.0">≥ 5.0 (Fuertes)</option>
+        <option value="6.0">≥ 6.0 (Mayores)</option>
+      </select>
+    </div>
+
+    <div class="filtro-grupo">
+      <label for="filtro-pais">🌍 País o Territorio:</label>
+      <select id="filtro-pais" (change)="onPaisChange($event)">
+        <option value="">Todos los países</option>
+        <option value="NULL">Sin país asignado (marítimos)</option>
+        <option *ngFor="let p of listaPaisesDisponibles()" [value]="p.id">
+          {{ p.nombre }} ({{ p.id }})
+        </option>
+      </select>
+    </div>
+
+    <div class="filtro-acciones">
+      <button type="button" class="btn-refresh" (click)="refresh()">🔄 Actualizar</button>
+      <button type="button" class="btn-tabla" (click)="toggleTabla()">
+        {{ mostrarTabla() ? '🗺️ Ver Mapa' : '📋 Ver Tabla de Eventos' }}
+      </button>
+    </div>
+  </section>
+
+  <!-- Tarjetas KPI Resumen -->
+  <section class="kpi-grid" *ngIf="stats() as st">
+    <div class="kpi-card">
+      <span class="kpi-titulo">Total Eventos</span>
+      <span class="kpi-valor">{{ st.resumen.total_eventos }}</span>
+      <span class="kpi-sub">En ventana de {{ st.periodo.duracion_horas }}h</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-titulo">Magnitud Media</span>
+      <span class="kpi-valor">{{ st.resumen.mag_media !== null ? st.resumen.mag_media.toFixed(2) : 'ND' }}</span>
+      <span class="kpi-sub">Máxima: {{ st.resumen.mag_maxima ?? 'ND' }}</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-titulo">Profundidad Media</span>
+      <span class="kpi-valor">{{ st.resumen.depth_media_km !== null ? st.resumen.depth_media_km.toFixed(1) + ' km' : 'ND' }}</span>
+      <span class="kpi-sub">Hipocentro promedio</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-titulo">Eventos Marítimos</span>
+      <span class="kpi-valor">{{ st.resumen.sin_pais_total }}</span>
+      <span class="kpi-sub">Sin país asignado</span>
+    </div>
+  </section>
+
+  <!-- Comparación Histórica (Requisito clave Punto 8) -->
+  <section class="comparacion-historica" *ngIf="stats() as st">
+    <div class="comp-header">
+      <h3>📊 Comparación Histórica: Actividad Sísmica Moderada (M ≥ 4.0)</h3>
+    </div>
+    <div class="comp-body">
+      <div class="comp-col">
+        <span class="comp-label">Últimas 24h registradas (M ≥ 4.0):</span>
+        <span class="comp-num">{{ st.comparacion_historica_m4.ultimas_24h_con_mag_gte_4 }}</span>
+      </div>
+      <div class="comp-vs">vs</div>
+      <div class="comp-col">
+        <span class="comp-label">Media diaria histórica (Año 2025):</span>
+        <span class="comp-num">{{ st.comparacion_historica_m4.media_diaria_historica_2025 }}</span>
+        <small>(Denominador: 365 días)</small>
+      </div>
+      <div class="comp-col comp-dif" [class.positivo]="st.comparacion_historica_m4.diferencia_pct >= 0" [class.negativo]="st.comparacion_historica_m4.diferencia_pct < 0">
+        <span class="comp-label">Variación respecto a la media:</span>
+        <span class="comp-num">{{ st.comparacion_historica_m4.diferencia_pct > 0 ? '+' : '' }}{{ st.comparacion_historica_m4.diferencia_pct }}%</span>
+      </div>
+    </div>
+    <p class="comp-nota">ℹ️ <em>{{ st.comparacion_historica_m4.nota }}</em></p>
+  </section>
+
+  <!-- Mapa Interactivo (si la tabla está oculta) -->
+  <div class="map-wrapper" [class.oculto]="mostrarTabla()">
+    <div class="map" leaflet [leafletOptions]="options" (leafletMapReady)="onMapReady($event)" aria-label="Mapa interactivo de terremotos"></div>
+    <div class="map-info-flotante">
+      Mostrando {{ count() }} eventos en mapa
+      <span *ngIf="isTruncated()">(Límite alcanzado: {{ totalDbCount() }} en base de datos)</span>
+      <span *ngIf="omitted() > 0">· {{ omitted() }} omitidos por coordenadas inválidas</span>
+    </div>
+  </div>
+
+  <!-- Tabla Accesible de Eventos (alternativa al mapa y al color) -->
+  <section class="tabla-panel" *ngIf="mostrarTabla()">
+    <div class="tabla-header">
+      <h2>📋 Registro Detallado de Eventos Sísmicos</h2>
+      <input type="text" placeholder="🔍 Buscar por lugar, país o ID..." (input)="onBusquedaTabla($event)" class="input-busqueda" />
+    </div>
+    <div class="table-responsive">
+      <table class="eventos-table" aria-label="Tabla accesible de terremotos">
+        <thead>
+          <tr>
+            <th>Fecha y Hora (UTC)</th>
+            <th>Magnitud</th>
+            <th>Profundidad</th>
+            <th>Ubicación</th>
+            <th>País</th>
+            <th>ID USGS</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let ev of eventosTablaFiltrados()">
+            <td>{{ date(ev.properties.time) }}</td>
+            <td>
+              <span class="tag-mag" [class.fuerte]="(ev.properties.mag ?? 0) >= 4.0">
+                {{ ev.properties.mag !== null ? ev.properties.mag.toFixed(1) : 'ND' }}
+              </span>
+            </td>
+            <td>
+              <span class="tag-depth">
+                {{ ev.geometry.coordinates[2] !== undefined ? ev.geometry.coordinates[2] + ' km' : 'ND' }}
+              </span>
+            </td>
+            <td>{{ ev.properties.place ?? 'Sin descripción' }}</td>
+            <td>{{ ev.properties.country_name ?? 'Sin país asignado (marítimo)' }}</td>
+            <td><code>{{ ev.id }}</code></td>
+          </tr>
+          <tr *ngIf="eventosTablaFiltrados().length === 0">
+            <td colspan="6" class="sin-resultados">No se encontraron eventos con los filtros aplicados.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <small class="tabla-pie">Mostrando los primeros {{ eventosTablaFiltrados().length }} eventos que coinciden con los criterios.</small>
+  </section>
+
+  <!-- Gráficos y Distribuciones (Punto 8) -->
+  <section class="analisis-seccion" *ngIf="stats() as st">
+    <div class="analisis-grid">
+      <!-- Distribución de Magnitud -->
+      <div class="grafico-card">
+        <h3>⚡ Distribución por Magnitud</h3>
+        <div class="barra-fila">
+          <span class="barra-label">&lt; 2.0 (Micro)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-verde" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_magnitud.menor_2 * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_magnitud.menor_2 }}</span>
+        </div>
+        <div class="barra-fila">
+          <span class="barra-label">2.0 – 3.9 (Menor)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-amarillo" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_magnitud.de_2_a_3_9 * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_magnitud.de_2_a_3_9 }}</span>
+        </div>
+        <div class="barra-fila">
+          <span class="barra-label">4.0 – 4.9 (Moderado)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-naranja" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_magnitud.de_4_a_4_9 * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_magnitud.de_4_a_4_9 }}</span>
+        </div>
+        <div class="barra-fila">
+          <span class="barra-label">5.0 – 5.9 (Fuerte)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-rojo" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_magnitud.de_5_a_5_9 * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_magnitud.de_5_a_5_9 }}</span>
+        </div>
+        <div class="barra-fila">
+          <span class="barra-label">≥ 6.0 (Mayor)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-purpura" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_magnitud.mayor_o_igual_6 * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_magnitud.mayor_o_igual_6 }}</span>
+        </div>
+        <div class="barra-fila" *ngIf="st.distribucion_magnitud.no_disponible > 0">
+          <span class="barra-label">No disponible (ND)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-gris" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_magnitud.no_disponible * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_magnitud.no_disponible }}</span>
+        </div>
+      </div>
+
+      <!-- Distribución de Profundidad -->
+      <div class="grafico-card">
+        <h3>🟣 Distribución por Profundidad (Hipocentro)</h3>
+        <div class="barra-fila">
+          <span class="barra-label">🟡 Superficial (&lt; 70 km)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-amarillo" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_profundidad.superficial_menos_70km * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_profundidad.superficial_menos_70km }}</span>
+        </div>
+        <div class="barra-fila">
+          <span class="barra-label">🟠 Intermedia (70–299 km)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-naranja" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_profundidad.intermedia_70_300km * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_profundidad.intermedia_70_300km }}</span>
+        </div>
+        <div class="barra-fila">
+          <span class="barra-label">🟣 Profunda (≥ 300 km)</span>
+          <div class="barra-track">
+            <div class="barra-fill c-purpura" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_profundidad.profunda_mas_300km * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_profundidad.profunda_mas_300km }}</span>
+        </div>
+        <div class="barra-fila" *ngIf="st.distribucion_profundidad.no_disponible > 0">
+          <span class="barra-label">⚪ No disponible</span>
+          <div class="barra-track">
+            <div class="barra-fill c-gris" [style.width.%]="st.resumen.total_eventos ? (st.distribucion_profundidad.no_disponible * 100 / st.resumen.total_eventos) : 0"></div>
+          </div>
+          <span class="barra-val">{{ st.distribucion_profundidad.no_disponible }}</span>
+        </div>
+      </div>
+
+      <!-- Top Países Activos -->
+      <div class="grafico-card">
+        <h3>🗺️ Actividad por País / Territorio</h3>
+        <div class="paises-lista">
+          <div class="pais-item" *ngFor="let p of st.por_pais.slice(0, 7)">
+            <span class="pais-nombre">{{ p.pais }}</span>
+            <span class="pais-cuenta"><b>{{ p.total }}</b> evs</span>
+            <span class="pais-mag">Mag media: {{ p.mag_promedio ?? 'ND' }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Leyenda y Pie -->
+  <footer>
+    <div class="leyenda">
+      <strong>Profundidad:</strong>
+      <span>🟡 Menos de 70 km</span>
+      <span>🟠 70–299,99 km</span>
+      <span>🟣 300 km o más</span>
+      <span>⚪ No disponible</span>
+    </div>
+    <p>
+      Tamaño de círculos: escala proporcional a la magnitud (radio mínimo 3px). 
+      El observatorio no realiza predicción de terremotos ni evalúa riesgo estructural. 
+      Datos: USGS Feed v1.0 · Límites: Natural Earth (WGS84).
+    </p>
+  </footer>
+</main>

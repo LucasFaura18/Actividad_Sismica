@@ -1,0 +1,27 @@
+# Entorno y credenciales
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Node / Angular
+node_modules/
+dist/
+.angular/
+npm-debug.log*
+
+# Grandes descargas de datos históricos (se regeneran con scripts/descargar_historico.py)
+datos/historico/*.geojson
+!datos/historico/manifest.json
+
+# Sistema y editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
