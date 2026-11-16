@@ -1,7 +1,8 @@
 # 🌍 Proyecto: Observatorio de Actividad Sísmica
 
 **Sistemas de Big Data · Consolidación de las sesiones 1–8 · RA1**  
-Sistema distribuido en contenedores Docker para la ingesta en tiempo real, transporte en streaming, enriquecimiento geográfico, persistencia relacional y análisis comparativo de terremotos a nivel global.
+- **Panel Web Desplegado (Netlify):** https://actividad-sismica.netlify.app
+- **Sistema distribuido en contenedores Docker** para la ingesta en tiempo real, transporte en streaming, enriquecimiento geográfico, persistencia relacional y análisis comparativo de terremotos a nivel global.
 
 ---
 
