@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Modelo de Datos - Diagramas Visuales</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({startOnLoad: true, theme: 'neutral'});</script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 30px auto; padding: 20px; color: #1e293b; background: #f8fafc; }
+    h1 { color: #0f172a; margin-bottom: 8px; }
+    h2 { color: #0f766e; border-bottom: 2px solid #cbd5e1; padding-bottom: 8px; margin-top: 32px; }
+    .card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 24px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border: 1px solid #e2e8f0; padding: 10px; text-align: left; }
+    th { background: #f1f5f9; color: #334155; }
+    .badge { background: #0f766e; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+  <h1>🏛️ Modelo de Datos y Arquitectura de Idempotencia</h1>
+  <p>Defensa Técnica: Sistemas de Big Data · Consolidación RA1</p>
+
+  <div class="card">
+    <h2>1. Modelo Conceptual y Relacional (Entidad - Relación)</h2>
+    <div class="mermaid">
+    erDiagram
+        DIM_PAIS ||--o{ EVENTOS_ACTUALES : "se localiza en"
+        EVENTOS_ACTUALES ||--o{ EVENTOS_VERSIONES : "tiene revisiones"
+        CONSULTAS_REGISTRO ||--o{ EVENTOS_RAW : "extrae"
+        EVENTOS_CUARENTENA }o--|| CONSULTAS_REGISTRO : "aislado de"
+
+        EVENTOS_ACTUALES {
+            string id PK "Identificador único USGS"
+            int time_ms "Fecha y hora del sismo UTC"
+            int updated_ms "Fecha de última revisión USGS"
+            float mag "Magnitud"
+            float depth_km "Profundidad en km"
+            float lon "Longitud WGS84"
+            float lat "Latitud WGS84"
+            string country_id FK "Código ADM0_A3 o NULL"
+        }
+
+        DIM_PAIS {
+            string country_id PK "Código ADM0_A3 único"
+            string country_name "Nombre oficial"
+            string continent "Continente"
+            string subregion "Subregión"
+        }
+
+        EVENTOS_VERSIONES {
+            string id PK "Identificador único"
+            int updated_ms PK "Timestamp de revisión"
+            float mag "Magnitud en esa revisión"
+            timestamp procesado_en "Fecha de registro"
+        }
+
+        EVENTOS_CUARENTENA {
+            int cuarentena_id PK "ID autonumérico"
+            string motivo "Motivo de rechazo"
+            jsonb payload_raw "Payload original"
+        }
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. Decisión Técnica: Semántica At-Least-Once e Idempotencia</h2>
+    <p>El consumidor confirma el offset en Kafka <b>únicamente tras el COMMIT exitoso en PostgreSQL</b>.</p>
+    <div class="mermaid">
+    sequenceDiagram
+        autonumber
+        participant K as Apache Kafka
+        participant C as Consumidor (Python)
+        participant PG as PostgreSQL (Transacción)
+
+        K->>C: Mensaje con evento (id, updated_ms)
+        C->>PG: BEGIN TRANSACTION
+        C->>PG: SELECT updated_ms FROM eventos_actuales WHERE id = $id
+        alt Es nuevo
+            C->>PG: INSERT INTO eventos_actuales + eventos_versiones
+        else updated_ms > actual
+            C->>PG: UPDATE eventos_actuales + INSERT eventos_versiones
+        else updated_ms <= actual (duplicado o regresión)
+            C->>PG: DO NOTHING (ignorar cambios)
+        end
+        C->>PG: COMMIT
+        C->>K: commit_offset(partition, offset)
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Grano de las Entidades Principales</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Tabla</th>
+          <th>Grano (Qué representa 1 fila)</th>
+          <th>Clave Primaria (PK)</th>
+          <th>Relación / Clave Foránea</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>eventos_actuales</b></td>
+          <td>Estado vigente de 1 terremoto individual</td>
+          <td><span class="badge">id</span></td>
+          <td><code>country_id</code> ➔ <code>dim_pais(country_id)</code></td>
+        </tr>
+        <tr>
+          <td><b>dim_pais</b></td>
+          <td>1 país o territorio de referencia</td>
+          <td><span class="badge">country_id</span></td>
+          <td>177 países de Natural Earth (WGS84)</td>
+        </tr>
+        <tr>
+          <td><b>eventos_versiones</b></td>
+          <td>1 revisión histórica de un terremoto</td>
+          <td><span class="badge">(id, updated_ms)</span></td>
+          <td>Auditoría de cambios de magnitud y coordenadas</td>
+        </tr>
+        <tr>
+          <td><b>eventos_cuarentena</b></td>
+          <td>1 evento rechazado por coordenadas inválidas</td>
+          <td><span class="badge">cuarentena_id</span></td>
+          <td>Aislado sin contaminar el análisis</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+</body>
+</html>

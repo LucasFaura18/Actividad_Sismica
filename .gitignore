@@ -25,3 +25,5 @@ datos/historico/*.geojson
 Thumbs.db
 .idea/
 .vscode/
+ngrok.exe
+ngrok

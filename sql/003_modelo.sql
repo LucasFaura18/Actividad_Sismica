@@ -1,49 +1,25 @@
--- Modelo de datos procesados (Punto 6 — Calidad y transformación).
--- Todas las tablas usan CREATE TABLE IF NOT EXISTS: seguras de re-ejecutar.
+-- Modelo de eventos procesados, versiones y cuarentena
 
--- ──────────────────────────────────────────────────────────────────────
--- Estado actual: una fila por evento, siempre la versión más reciente.
--- La API consulta esta tabla para /api/eventos.
--- ──────────────────────────────────────────────────────────────────────
+-- Estado vigente de cada terremoto
 CREATE TABLE IF NOT EXISTS eventos_actuales (
     id              TEXT            PRIMARY KEY,
-
-    -- Tiempos en ms epoch UTC (conservados tal como llegan de USGS).
-    -- No se convierte zona horaria: epoch UTC es independiente de zona.
-    time_ms         BIGINT          NOT NULL,   -- momento del terremoto
-    updated_ms      BIGINT          NOT NULL,   -- última revisión en USGS
-    ingested_at_ms  BIGINT          NOT NULL,   -- cuándo lo publicó el productor
-    procesado_en    TIMESTAMPTZ     NOT NULL DEFAULT NOW(), -- cuándo lo procesó el consumidor
-
-    -- Magnitud: NULL si no disponible. Se conserva (no se rellena con 0).
-    -- Una magnitud negativa no es automáticamente un error (flag, no rechazo).
+    time_ms         BIGINT          NOT NULL,
+    updated_ms      BIGINT          NOT NULL,
+    ingested_at_ms  BIGINT          NOT NULL,
+    procesado_en    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     mag             NUMERIC(5,2),
     mag_type        TEXT,
-
-    -- Localización textual: NULL afecta a completitud pero no invalida el evento.
     place           TEXT,
-
-    -- Coordenadas WGS84; obligatorias (inválidas → cuarentena).
     lon             DOUBLE PRECISION NOT NULL,
     lat             DOUBLE PRECISION NOT NULL,
-
-    -- Profundidad en km: NULL si no disponible.
-    -- Los valores negativos son válidos en USGS (eventos muy superficiales);
-    -- se conservan con flag pero no se rechazan.
     depth_km        DOUBLE PRECISION,
-
-    -- Enriquecimiento geográfico (punto-en-polígono con Natural Earth).
-    -- NULL = evento marítimo, simplificación de costa o sin cobertura. No es error.
     country_id      TEXT,
     country_name    TEXT,
     continent       TEXT,
     subregion       TEXT,
-
-    -- Metadatos de ingesta
     source          TEXT            NOT NULL DEFAULT 'usgs_live',
     mode            TEXT            NOT NULL DEFAULT 'live',
-
-    -- Flags de calidad (para análisis; no filtran el evento)
+    -- Flags para marcar valores nulos o atípicos sin descartar la fila
     mag_nula        BOOLEAN         NOT NULL DEFAULT FALSE,
     mag_negativa    BOOLEAN         NOT NULL DEFAULT FALSE,
     depth_nula      BOOLEAN         NOT NULL DEFAULT FALSE,
@@ -52,16 +28,13 @@ CREATE TABLE IF NOT EXISTS eventos_actuales (
     sin_pais        BOOLEAN         NOT NULL DEFAULT FALSE
 );
 
--- Índices para los filtros de /api/eventos y /api/estadisticas
+-- Índices para acelerar las consultas de la API
 CREATE INDEX IF NOT EXISTS idx_ev_act_time    ON eventos_actuales (time_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_ev_act_country ON eventos_actuales (country_id);
 CREATE INDEX IF NOT EXISTS idx_ev_act_mag     ON eventos_actuales (mag);
 CREATE INDEX IF NOT EXISTS idx_ev_act_mode    ON eventos_actuales (mode);
 
--- ──────────────────────────────────────────────────────────────────────
--- Histórico de versiones recibidas por evento.
--- Permite auditar revisiones y detectar regresiones (updated < anterior).
--- ──────────────────────────────────────────────────────────────────────
+-- Histórico de versiones recibidas por sismo
 CREATE TABLE IF NOT EXISTS eventos_versiones (
     id              TEXT            NOT NULL,
     updated_ms      BIGINT          NOT NULL,
@@ -79,13 +52,10 @@ CREATE TABLE IF NOT EXISTS eventos_versiones (
 
 CREATE INDEX IF NOT EXISTS idx_ev_ver_id ON eventos_versiones (id);
 
--- ──────────────────────────────────────────────────────────────────────
--- Cuarentena: eventos que no pasan validación.
--- Se conservan íntegros con motivo y referencia al raw original.
--- ──────────────────────────────────────────────────────────────────────
+-- Eventos descartados por fallos de validación (coordenadas fuera de rango o JSON corrupto)
 CREATE TABLE IF NOT EXISTS eventos_cuarentena (
     cuarentena_id   BIGSERIAL       PRIMARY KEY,
-    id              TEXT,           -- NULL si el id mismo es inválido
+    id              TEXT,
     updated_ms      BIGINT,
     motivo          TEXT            NOT NULL,
     detalle         TEXT,
@@ -96,10 +66,7 @@ CREATE TABLE IF NOT EXISTS eventos_cuarentena (
 
 CREATE INDEX IF NOT EXISTS idx_cuarentena_motivo ON eventos_cuarentena (motivo);
 
--- ──────────────────────────────────────────────────────────────────────
--- Log de transformaciones por lote procesado.
--- Registra cuántos registros afecta cada decisión.
--- ──────────────────────────────────────────────────────────────────────
+-- Registro de transformaciones por lote
 CREATE TABLE IF NOT EXISTS transformaciones_log (
     log_id              BIGSERIAL   PRIMARY KEY,
     registrado_en       TIMESTAMPTZ NOT NULL DEFAULT NOW(),

@@ -1,15 +1,5 @@
 """
-API FastAPI: consulta de datos sísmicos ya procesados y preparados en PostgreSQL.
-
-Cumple con CONTRATO-API.md y los requisitos del Punto 8:
-- GET /api/salud: estado del servicio, estado de PostgreSQL y timestamp de última ingesta.
-- GET /api/eventos: FeatureCollection GeoJSON con filtros (start, end, min_mag, country_id),
-  limitación configurable, metadatos y flags de truncado.
-- GET /api/estadisticas:
-    * Agregación por país / región (incluye 'Sin país asignado').
-    * Ventanas horarias fijas de 1 hora UTC.
-    * Distribución de magnitud y profundidad (con recuento de nulos).
-    * Comparación histórica (últimas 24h mag >= 4 vs media diaria 2025).
+API FastAPI: endpoints para consultar los eventos sísmicos y estadísticas.
 """
 
 import logging
@@ -47,7 +37,7 @@ async def vida(app: FastAPI):
 
 app = FastAPI(title="Observatorio de Actividad Sísmica - API", lifespan=vida)
 
-# Configuración CORS para el frontend (local y Netlify)
+# Configuración CORS para el frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(ajustes.cors_origins) if ajustes.cors_origins else ["*"],
@@ -59,10 +49,9 @@ app.add_middleware(
 
 
 async def obtener_ultima_ingesta(pool: asyncpg.Pool) -> Optional[int]:
-    """Obtiene el timestamp Unix ms de la última consulta correcta a USGS."""
+    # Obtiene la fecha en ms del último evento o consulta registrada
     try:
         async with pool.acquire() as conn:
-            # Primero intentar desde consultas_registro
             row = await conn.fetchrow(
                 """
                 SELECT EXTRACT(EPOCH FROM consultado_en) * 1000 AS ts
@@ -74,7 +63,6 @@ async def obtener_ultima_ingesta(pool: asyncpg.Pool) -> Optional[int]:
             )
             if row and row["ts"]:
                 return int(row["ts"])
-            # Fallback a ingested_at_ms del evento más reciente
             ts = await conn.fetchval("SELECT MAX(ingested_at_ms) FROM eventos_actuales")
             return int(ts) if ts else None
     except Exception as exc:
@@ -84,7 +72,6 @@ async def obtener_ultima_ingesta(pool: asyncpg.Pool) -> Optional[int]:
 
 @app.get("/api/salud")
 async def salud():
-    """Estado de salud de la API y fecha de última ingesta exitosa."""
     pool: asyncpg.Pool = app.state.pool
     postgres_ok = False
     try:
@@ -114,15 +101,12 @@ async def salud():
 
 
 def parse_timestamp_ms(val: Optional[str]) -> Optional[int]:
-    """Convierte cadena ISO8601 o entero ms a entero ms epoch UTC."""
     if not val:
         return None
     val = val.strip()
     try:
-        # Si es un número (ej. "1793109600000")
         if val.isdigit() or (val.startswith("-") and val[1:].isdigit()):
             return int(val)
-        # Si es ISO8601 (ej. "2026-11-16T00:00:00Z")
         dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
         return int(dt.timestamp() * 1000)
     except Exception:
@@ -138,14 +122,11 @@ async def eventos(
     mode: str = Query("live", description="Modo de consulta ('live' o 'replay')"),
     limit: int = Query(2000, ge=1, le=10000, description="Límite máximo de eventos"),
 ):
-    """
-    Devuelve un GeoJSON FeatureCollection con eventos sísmicos preparados.
-    Por defecto devuelve terremotos de las últimas 24 horas en modo live.
-    """
+    # Consulta de terremotos con filtros
     pool: asyncpg.Pool = app.state.pool
     ahora_ms = int(time.time() * 1000)
 
-    # Ventana por defecto: últimas 24 horas si no se indica start
+    # Por defecto filtramos últimas 24 horas si no se pasa fecha de inicio
     start_ms = parse_timestamp_ms(start)
     if start_ms is None:
         start_ms = ahora_ms - (24 * 60 * 60 * 1000)
@@ -162,7 +143,6 @@ async def eventos(
         idx += 1
 
     if min_mag is not None:
-        # Magnitudes nulas no cumplen min_mag
         condiciones.append(f"mag IS NOT NULL AND mag >= ${idx}")
         parametros.append(min_mag)
         idx += 1
@@ -251,14 +231,7 @@ async def estadisticas(
     country_id: Optional[str] = Query(None, description="Código ADM0_A3"),
     mode: str = Query("live", description="Modo ('live' o 'replay')"),
 ):
-    """
-    Agregaciones estadísticas sobre el estado actual:
-    - Recuentos por país (incluye 'Sin país asignado')
-    - Recuentos por ventana horaria de 1 hora UTC
-    - Distribución de magnitudes (con recuento de nulos)
-    - Distribución de profundidades (superficial, intermedia, profunda, nulos)
-    - Comparación histórica (últimas 24h mag >= 4 frente a promedio diario 2025)
-    """
+    # Agregaciones estadísticas y métricas para el dashboard
     pool: asyncpg.Pool = app.state.pool
     ahora_ms = int(time.time() * 1000)
 
@@ -295,7 +268,7 @@ async def estadisticas(
 
     try:
         async with pool.acquire() as conn:
-            # 1. Total eventos y nulos en el periodo filtrado
+            # 1. Totales generales del periodo
             totales = await conn.fetchrow(
                 f"""
                 SELECT 
@@ -312,7 +285,7 @@ async def estadisticas(
                 *parametros,
             )
 
-            # 2. Recuento por País (Top 15 + Sin país)
+            # 2. Ranking de eventos por país
             por_pais = await conn.fetch(
                 f"""
                 SELECT 
@@ -329,7 +302,7 @@ async def estadisticas(
                 *parametros,
             )
 
-            # 3. Ventanas fijas de 1 hora UTC (usando el tiempo del evento)
+            # 3. Agrupación por ventana horaria UTC
             por_hora = await conn.fetch(
                 f"""
                 SELECT 
@@ -344,7 +317,7 @@ async def estadisticas(
                 *parametros,
             )
 
-            # 4. Distribución de magnitudes por tramos
+            # 4. Distribución por tramos de magnitud
             dist_mag = await conn.fetchrow(
                 f"""
                 SELECT 
@@ -360,13 +333,13 @@ async def estadisticas(
                 *parametros,
             )
 
-            # 5. Distribución de profundidades (clasificación sismológica estándar)
+            # 5. Distribución por tramos de profundidad
             dist_depth = await conn.fetchrow(
                 f"""
                 SELECT 
-                    count(*) FILTER (WHERE depth_km < 70.0) AS superficial,       -- < 70 km
-                    count(*) FILTER (WHERE depth_km >= 70.0 AND depth_km < 300.0) AS intermedia, -- 70 - 299.9 km
-                    count(*) FILTER (WHERE depth_km >= 300.0) AS profunda,       -- >= 300 km
+                    count(*) FILTER (WHERE depth_km < 70.0) AS superficial,
+                    count(*) FILTER (WHERE depth_km >= 70.0 AND depth_km < 300.0) AS intermedia,
+                    count(*) FILTER (WHERE depth_km >= 300.0) AS profunda,
                     count(*) FILTER (WHERE depth_km IS NULL) AS no_disponible
                 FROM eventos_actuales
                 WHERE {where_clause}
@@ -374,8 +347,7 @@ async def estadisticas(
                 *parametros,
             )
 
-            # 6. Comparación Histórica:
-            # - Recuento actual de las últimas 24h con mag >= 4.0 (filtrado por país si aplica)
+            # 6. Comparación con la media histórica de 2025 para mag >= 4.0
             cond_24h_m4 = ["mode = 'live'", f"time_ms >= {ahora_ms - 86400000}", "mag >= 4.0"]
             if country_id and country_id.upper() not in ("NULL", "SIN_PAIS"):
                 cond_24h_m4.append(f"country_id = '{country_id.upper()}'")
@@ -383,8 +355,6 @@ async def estadisticas(
                 f"SELECT count(*) FROM eventos_actuales WHERE {' AND '.join(cond_24h_m4)}"
             )
 
-            # - Referencia histórica (promedio diario mundial o del país con mag >= 4.0 en 2025):
-            # Nota: el catálogo 2025 tiene ~14,000 eventos anuales mag >= 4.0 a nivel mundial (media ~38.3/día en 365 días).
             media_historica_diaria_m4 = 38.35
             nota_comparativa = (
                 "Referencia global 2025: ~14.000 terremotos mag>=4.0 anuales distribuidos en 365 días (media ~38,35/día). "

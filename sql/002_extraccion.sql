@@ -1,18 +1,13 @@
--- Tablas de extracción e ingesta (Punto 5).
--- CREATE TABLE IF NOT EXISTS: seguro de ejecutar más de una vez.
--- Para bases ya existentes: docker compose exec postgres psql -U observatorio observatorio -f /docker-entrypoint-initdb.d/002_extraccion.sql
+-- Tablas para el estado del productor y guardado de datos raw
 
--- Estado persistente del productor: última versión publicada por evento.
--- Permite comparar id+updated entre reinicios sin perder el historial.
+-- Guarda la última versión enviada a Kafka por cada evento
 CREATE TABLE IF NOT EXISTS productor_estado (
     id           TEXT        PRIMARY KEY,
     updated_ms   BIGINT      NOT NULL,
     publicado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- GeoJSON original recibido de USGS antes de cualquier transformación.
--- Clave compuesta (id, updated_ms): evita guardar copias idénticas.
--- Retención: el productor limpia filas con recibido_en > RETENCION_RAW_DIAS días.
+-- Guarda el GeoJSON original de USGS sin transformar
 CREATE TABLE IF NOT EXISTS eventos_raw (
     id          TEXT        NOT NULL,
     updated_ms  BIGINT      NOT NULL,
@@ -22,8 +17,7 @@ CREATE TABLE IF NOT EXISTS eventos_raw (
     PRIMARY KEY (id, updated_ms)
 );
 
--- Registro de cada ciclo de consulta al feed USGS.
--- Incluye latencia, conteos y errores para documentar la extracción.
+-- Registro de peticiones al feed de USGS
 CREATE TABLE IF NOT EXISTS consultas_registro (
     consulta_id       BIGSERIAL   PRIMARY KEY,
     consultado_en     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -37,5 +31,4 @@ CREATE TABLE IF NOT EXISTS consultas_registro (
     error             TEXT
 );
 
--- Índice para la limpieza por retención
 CREATE INDEX IF NOT EXISTS idx_eventos_raw_recibido ON eventos_raw (recibido_en);

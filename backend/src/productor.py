@@ -1,51 +1,6 @@
 """
-Productor: consulta el feed USGS cada POLL_SECONDS y publica en Kafka
-únicamente los eventos nuevos o con una versión posterior (updated mayor).
-
-──────────────────────────────────────────────────────────────────────
-Estado persistente (PostgreSQL · tabla productor_estado)
-  id → updated_ms de la última versión publicada.
-  Se carga al arrancar y se actualiza tras cada ack de Kafka.
-  No se pierde entre reinicios del contenedor.
-
-Garantía at-least-once:
-  1. Guardar raw en eventos_raw.
-  2. Publicar en Kafka y esperar ack (acks="all").
-  3. Actualizar productor_estado.
-  Si el proceso cae entre los pasos 2 y 3, el mensaje puede reenviarse.
-  El consumidor tolera este duplicado verificando updated antes de persistir.
-
-Mensaje Kafka (valor JSON, clave = id del evento en UTF-8):
-  {
-    "source":      "usgs_live",
-    "ingested_at": <ms Unix epoch UTC>,
-    "mode":        "live",          ← "replay" en el productor histórico
-    "event":       { id, time, updated, mag, magType, type, place,
-                     lon, lat, depth_km },
-    "raw":         { <feature GeoJSON original de USGS> }
-  }
-
-Gestión de errores HTTP:
-  - 429 Too Many Requests: espera Retry-After o 2× POLL_SECONDS.
-  - 5xx: registra error, omite el ciclo, no borra estado anterior.
-  - Timeout: registra, omite el ciclo.
-  - JSON inválido: registra, omite el ciclo.
-
-Eventos que salen del feed:
-  «No aparece en la ventana actual» ≠ «USGS lo ha eliminado».
-  Puede haber envejecido más de 24 h (comportamiento normal del feed).
-  El estado en productor_estado se conserva; no se borra al desaparecer.
-
-  LIMITACIÓN documentada (fuera del alcance mínimo):
-  La reconciliación de eventos eliminados, fusionados o revisados cuando ya
-  están fuera del feed live requiere cruzar con el catálogo histórico.
-  No se implementa en este punto; se documenta como ampliación pendiente.
-
-Recuperación tras parada > 24 h:
-  Los eventos del hueco no aparecen en el feed live (ventana de solo 24 h).
-  Procedimiento: ejecutar scripts/descargar_historico.py para el rango
-  afectado y luego el script de replay (productor_replay.py, punto siguiente).
-  El replay usa el mismo topic con mode="replay" para mantener el aislamiento.
+Productor: consulta el feed de USGS periódicamente y publica en Kafka
+los eventos nuevos o con versiones actualizadas.
 """
 
 import asyncio
@@ -70,13 +25,10 @@ log = logging.getLogger("productor")
 LISTO = Path("/tmp/ready")
 
 USGS_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson"
-TIMEOUT_HTTP = 30       # segundos para la petición USGS
-RETENCION_RAW_DIAS = 7  # días que se conserva el raw antes de limpiar
+TIMEOUT_HTTP = 30
+RETENCION_RAW_DIAS = 7
 
-# ──────────────────────────────────────────────────────────────────────
-# PostgreSQL: esquema propio del productor
-# ──────────────────────────────────────────────────────────────────────
-
+# Tablas internas para el seguimiento del productor y guardar datos raw
 CREAR_TABLAS = """
 CREATE TABLE IF NOT EXISTS productor_estado (
     id           TEXT        PRIMARY KEY,
@@ -117,7 +69,7 @@ async def inicializar_tablas(pool: asyncpg.Pool) -> None:
 
 
 async def cargar_estado(pool: asyncpg.Pool) -> dict[str, int]:
-    """Carga id → updated_ms desde productor_estado al arrancar."""
+    # Carga id -> updated_ms para saber qué eventos ya publicamos
     async with pool.acquire() as conn:
         filas = await conn.fetch("SELECT id, updated_ms FROM productor_estado")
     estado = {f["id"]: f["updated_ms"] for f in filas}
@@ -130,10 +82,7 @@ async def guardar_raw(
     feature: dict,
     fuente: str = "usgs_live",
 ) -> None:
-    """
-    Guarda el GeoJSON original antes de cualquier transformación.
-    ON CONFLICT DO NOTHING evita duplicar versiones idénticas.
-    """
+    # Guarda el GeoJSON original en base de datos antes de enviar a Kafka
     eid = feature.get("id", "")
     updated = (feature.get("properties") or {}).get("updated") or 0
     async with pool.acquire() as conn:
@@ -148,7 +97,7 @@ async def guardar_raw(
 
 
 async def registrar_consulta(pool: asyncpg.Pool, **kwargs) -> None:
-    """Escribe una fila en consultas_registro con los datos del ciclo."""
+    # Registra el resultado del intento de consulta a USGS
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -171,7 +120,7 @@ async def registrar_consulta(pool: asyncpg.Pool, **kwargs) -> None:
 async def marcar_publicado(
     pool: asyncpg.Pool, eid: str, updated_ms: int
 ) -> None:
-    """Actualiza productor_estado DESPUÉS de recibir el ack de Kafka."""
+    # Actualiza la versión enviada tras confirmar recepción en Kafka
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -186,7 +135,7 @@ async def marcar_publicado(
 
 
 async def limpiar_raw(pool: asyncpg.Pool) -> None:
-    """Elimina eventos_raw más antiguos que RETENCION_RAW_DIAS días."""
+    # Limpia datos raw con más de 7 días
     async with pool.acquire() as conn:
         eliminados = await conn.fetchval(
             """
@@ -202,10 +151,6 @@ async def limpiar_raw(pool: asyncpg.Pool) -> None:
     if eliminados:
         log.info("Limpieza raw: %d filas eliminadas (> %d días)", eliminados, RETENCION_RAW_DIAS)
 
-
-# ──────────────────────────────────────────────────────────────────────
-# Kafka
-# ──────────────────────────────────────────────────────────────────────
 
 async def asegurar_topic() -> None:
     admin = AIOKafkaAdminClient(bootstrap_servers=ajustes.kafka_servers)
@@ -228,10 +173,6 @@ async def asegurar_topic() -> None:
         await admin.close()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Extracción USGS
-# ──────────────────────────────────────────────────────────────────────
-
 class ErrorHTTP(Exception):
     def __init__(self, status: int, retry_after: int | None = None):
         self.status = status
@@ -241,17 +182,12 @@ class ErrorHTTP(Exception):
 async def obtener_feed(
     cliente: httpx.AsyncClient,
 ) -> tuple[list[dict], list[dict], dict]:
-    """
-    Descarga el feed USGS.
-    Devuelve (terremotos, excluidos, meta) donde meta contiene latencia y status.
-    Lanza ErrorHTTP para 429/5xx; deja que el caller decida cómo esperar.
-    Lanza httpx.TimeoutException para timeout.
-    Lanza ValueError para JSON inválido.
-    """
+    # Descarga el GeoJSON del feed de USGS
     t0 = time.monotonic()
     respuesta = await cliente.get(USGS_URL, timeout=TIMEOUT_HTTP)
     latencia_ms = int((time.monotonic() - t0) * 1000)
 
+    # Manejo de rate limit (429) o errores del servidor
     if respuesta.status_code == 429:
         retry_after = int(respuesta.headers.get("Retry-After", 0)) or None
         raise ErrorHTTP(429, retry_after)
@@ -294,21 +230,7 @@ async def obtener_feed(
 
 
 def extraer_evento(feature: dict) -> dict | None:
-    """
-    Normaliza un feature USGS al esquema del mensaje Kafka.
-
-    Tipos y unidades:
-      id        str         — identificador único USGS
-      time      int (ms)    — tiempo del terremoto, epoch UTC
-      updated   int (ms)    — última revisión en USGS, epoch UTC
-      mag       float|None  — magnitud; None si no disponible
-      magType   str|None    — tipo de magnitud (ml, mb, mww…)
-      type      str         — siempre "earthquake" tras el filtro
-      place     str|None    — descripción textual de ubicación
-      lon       float       — longitud WGS84 (-180..180)
-      lat       float       — latitud WGS84 (-90..90)
-      depth_km  float|None  — profundidad en kilómetros
-    """
+    # Extrae y normaliza las propiedades básicas del sismo
     try:
         props = feature.get("properties") or {}
         coords = (feature.get("geometry") or {}).get("coordinates") or []
@@ -329,14 +251,10 @@ def extraer_evento(feature: dict) -> dict | None:
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Bucle principal
-# ──────────────────────────────────────────────────────────────────────
-
 async def main() -> None:
     LISTO.unlink(missing_ok=True)
 
-    # 1. Conectar a Kafka y PostgreSQL (con reintentos)
+    # Conexión a Kafka y PostgreSQL
     await esperar("Kafka (topic)", asegurar_topic)
 
     async def crear_pool():
@@ -352,7 +270,7 @@ async def main() -> None:
     )
     await esperar("Kafka (productor)", productor.start)
 
-    # 2. Inicializar esquema propio y cargar estado persistente
+    # Verificamos tablas y cargamos eventos ya conocidos
     await inicializar_tablas(pool)
     await limpiar_raw(pool)
     vistos: dict[str, int] = await cargar_estado(pool)
@@ -363,17 +281,16 @@ async def main() -> None:
         ajustes.kafka_topic, ajustes.poll_seconds, len(vistos),
     )
 
-    extra_espera = 0  # segundos adicionales tras un 429
+    extra_espera = 0
 
     try:
         async with httpx.AsyncClient() as cliente:
             while True:
                 if extra_espera > 0:
-                    log.info("Esperando %ss extra (backoff 429)…", extra_espera)
+                    log.info("Esperando %ss extra tras recibir 429...", extra_espera)
                     await asyncio.sleep(extra_espera)
                     extra_espera = 0
 
-                # ── Extracción ─────────────────────────────────────
                 terremotos = []
                 meta: dict = {"url": USGS_URL}
                 try:
@@ -400,7 +317,7 @@ async def main() -> None:
                     log.error("Error inesperado en extracción: %s · omitiendo ciclo", exc)
                     meta["error"] = str(exc)
 
-                # ── Publicación ────────────────────────────────────
+                # Publicar únicamente novedades o revisiones
                 publicados = 0
                 for feature in terremotos:
                     evento = extraer_evento(feature)
@@ -410,14 +327,12 @@ async def main() -> None:
                     eid = evento["id"]
                     updated = evento.get("updated") or 0
 
-                    # Comparar con estado persistente: solo publicar novedades
                     if vistos.get(eid, -1) >= updated:
-                        continue  # versión ya publicada o más reciente en estado
+                        continue
 
-                    # Guardar GeoJSON original ANTES de publicar
+                    # Guardamos el raw original
                     await guardar_raw(pool, feature)
 
-                    # Construir mensaje Kafka
                     mensaje = {
                         "source":      "usgs_live",
                         "ingested_at": int(time.time() * 1000),
@@ -426,20 +341,18 @@ async def main() -> None:
                         "raw":         feature,
                     }
 
-                    # Publicar usando id del evento como clave (at-least-once)
-                    # La clave garantiza que revisiones del mismo evento van
-                    # a la misma partición (relevante si se amplían particiones).
+                    # Enviamos a Kafka con clave id
                     await productor.send(
                         ajustes.kafka_topic,
                         key=eid,
                         value=mensaje,
                     )
-                    # ack recibido (acks="all") → actualizar estado persistente
+                    # Marcamos como publicado en postgres
                     await marcar_publicado(pool, eid, updated)
                     vistos[eid] = updated
                     publicados += 1
 
-                # ── Registro de la consulta ────────────────────────
+                # Guardamos log de la consulta
                 await registrar_consulta(
                     pool,
                     publicados=publicados,

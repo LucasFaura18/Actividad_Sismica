@@ -1,42 +1,6 @@
 """
-Consumidor: valida, limpia, enriquece y persiste eventos sísmicos.
-
-──────────────────────────────────────────────────────────────────────
-Dimensiones de calidad y reglas aplicadas:
-
-1. VALIDEZ:
-   - Campos obligatorios: id, time, updated, lon, lat.
-   - Coordenadas finitas y en rango: lon en [-180, 180], lat en [-90, 90].
-   - Si no cumple validez: se envía a 'eventos_cuarentena' con el motivo exacto
-     y el JSON original íntegro. No se descarta silenciosamente ni se inventan puntos.
-
-2. COMPLETITUD & ANOMALÍAS:
-   - Magnitud nula: se conserva con flag 'mag_nula=True'. No se rellena con 0.
-   - Magnitud negativa: físicamente posible en sismología (eventos de microfractura);
-     se conserva con flag 'mag_negativa=True' y NO se rechaza.
-   - Profundidad nula: se conserva con flag 'depth_nula=True'.
-   - Profundidad negativa: válida en USGS (hipocentro por encima del nivel del mar);
-     se conserva con flag 'depth_negativa=True' y NO se rechaza.
-   - Localización (place) ausente: flag 'place_nulo=True'.
-
-3. ENRIQUECIMIENTO GEOGRÁFICO & CONSISTENCIA:
-   - Búsqueda punto-en-polígono con STRtree sobre Natural Earth (WGS84).
-   - Asigna country_id (ADM0_A3), country_name, continent, subregion.
-   - Evento marítimo / costa simplificada: country_id=None, flag 'sin_pais=True'.
-     Permanece en el análisis; NO se clasifica como error ni se inventa un país cercano.
-
-4. UNICIDAD & IDEMPOTENCIA (VERSIONES):
-   - Cada mensaje nuevo se compara con el 'updated_ms' existente en 'eventos_actuales'.
-   - Si es nuevo: INSERT en 'eventos_actuales' y 'eventos_versiones'.
-   - Si es una revisión más reciente (updated_ms > actual): UPDATE en 'eventos_actuales'
-     y nuevo INSERT en 'eventos_versiones'.
-   - Si es la misma versión o una versión anterior: se omite el cambio en 'eventos_actuales'
-     (no se pisa una versión posterior con una antigua) y se cuenta como duplicado.
-
-5. ACTUALIDAD Y PROVENIENCIA:
-   - Conserva time_ms (ocurrencia), updated_ms (revisión USGS), ingested_at_ms (ingesta)
-     y procesado_en (persistencia).
-   - Los offsets de Kafka se confirman (commit) ÚNICAMENTE tras persistir con éxito en Postgres.
+Consumidor: lee eventos de Kafka, valida coordenadas, enriquece con el país
+y guarda o actualiza en PostgreSQL.
 """
 
 import asyncio
@@ -64,8 +28,7 @@ def es_numero_finito(val) -> bool:
 
 
 async def inicializar_tablas_consumidor(pool: asyncpg.Pool) -> None:
-    """Verifica la existencia del modelo antes de procesar."""
-    # Leemos la definición desde el script SQL o ejecutamos aseguramiento
+    # Comprobamos que la tabla de eventos existe
     async with pool.acquire() as conn:
         await conn.execute("SELECT 1 FROM eventos_actuales LIMIT 1;")
     log.info("Tablas de eventos verificadas en PostgreSQL")
@@ -77,14 +40,10 @@ async def procesar_mensaje(
     raw_bytes: bytes,
     stats: dict,
 ) -> None:
-    """
-    Procesa un único mensaje de Kafka dentro de una transacción.
-    Aplica validación, enriquecimiento, cuarentena y persistencia.
-    """
     try:
         data = json.loads(raw_bytes.decode("utf-8"))
     except Exception as exc:
-        # JSON ilegible -> cuarentena directa
+        # Si el JSON viene corrupto lo mandamos directo a cuarentena
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -114,7 +73,7 @@ async def procesar_mensaje(
     place = evento.get("place")
     depth_km = evento.get("depth_km")
 
-    # 1. Validación de obligatoriedad y coordenadas
+    # Validación de campos obligatorios y límites de coordenadas
     motivos_cuarentena = []
     if not eid or not isinstance(eid, str):
         motivos_cuarentena.append("ID_AUSENTE_O_INVALIDO")
@@ -128,6 +87,7 @@ async def procesar_mensaje(
     if not es_numero_finito(lat) or not (-90.0 <= lat <= 90.0):
         motivos_cuarentena.append("LATITUD_FUERA_DE_RANGO")
 
+    # Si falla la validación espacial o de id, va a cuarentena
     if motivos_cuarentena:
         motivo_str = "; ".join(motivos_cuarentena)
         async with pool.acquire() as conn:
@@ -147,7 +107,7 @@ async def procesar_mensaje(
         log.warning("Evento en cuarentena (%s): %s", eid, motivo_str)
         return
 
-    # 2. Análisis de anomalías y completitud (flags de calidad)
+    # Flags de calidad para valores atípicos o nulos
     mag_nula = (mag is None or not es_numero_finito(mag))
     val_mag = None if mag_nula else float(mag)
     mag_negativa = (val_mag is not None and val_mag < 0.0)
@@ -170,7 +130,7 @@ async def procesar_mensaje(
     if place_nulo:
         stats["place_nulos"] += 1
 
-    # 3. Enriquecimiento geográfico
+    # Enriquecimiento con país mediante polígonos
     geo = catalogo.buscar(lon, lat)
     country_id = geo["country_id"]
     country_name = geo["country_name"]
@@ -181,17 +141,16 @@ async def procesar_mensaje(
     if sin_pais:
         stats["sin_pais"] += 1
 
-    # 4. Transacción de persistencia e idempotencia
+    # Guardar en base de datos controlando versiones y duplicados
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Consultar versión existente en eventos_actuales
             fila = await conn.fetchrow(
                 "SELECT updated_ms FROM eventos_actuales WHERE id = $1",
                 eid,
             )
 
             if fila is None:
-                # Evento completamente nuevo
+                # Sismo nuevo: insertamos en eventos_actuales y en el histórico de versiones
                 await conn.execute(
                     """
                     INSERT INTO eventos_actuales (
@@ -229,7 +188,7 @@ async def procesar_mensaje(
             else:
                 updated_existente = fila["updated_ms"]
                 if updated_ms > updated_existente:
-                    # Versión más reciente: actualizar eventos_actuales
+                    # Revisión más reciente: actualizamos el estado actual y guardamos versión
                     await conn.execute(
                         """
                         UPDATE eventos_actuales
@@ -275,13 +234,12 @@ async def procesar_mensaje(
                     )
                     stats["actualizados"] += 1
                 else:
-                    # Versión idéntica o anterior (regresión/duplicado de Kafka):
-                    # No sustituye a la más reciente
+                    # Si llega una versión repetida o más antigua, la ignoramos
                     stats["omitidos_duplicado"] += 1
 
 
 async def registrar_log_transformacion(pool: asyncpg.Pool, lote_size: int, stats: dict) -> None:
-    """Registra en auditoría las transformaciones del lote procesado."""
+    # Guarda métricas del lote procesado
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -307,17 +265,16 @@ async def registrar_log_transformacion(pool: asyncpg.Pool, lote_size: int, stats
 async def main() -> None:
     LISTO.unlink(missing_ok=True)
 
-    # 1. Cargar catálogo geográfico
+    # Cargamos el mapa de países
     catalogo = CatalogoGeografico()
 
-    # 2. Conectar a PostgreSQL
     async def crear_pool():
         return await asyncpg.create_pool(ajustes.postgres_dsn, min_size=1, max_size=5)
 
     pool: asyncpg.Pool = await esperar("PostgreSQL", crear_pool)
     await esperar("Esquema PostgreSQL", lambda: inicializar_tablas_consumidor(pool))
 
-    # 3. Conectar a Kafka Consumer (escucha tanto live como replay de forma aislada)
+    # Consumidor de Kafka con confirmación manual (enable_auto_commit=False)
     topics = [ajustes.kafka_topic, "terremotos.replay"]
     consumidor = AIOKafkaConsumer(
         *topics,
@@ -329,14 +286,13 @@ async def main() -> None:
     await esperar("Kafka", consumidor.start)
     LISTO.write_text("ok", encoding="utf-8")
     log.info(
-        "Consumidor listo · topics=%s · group=%s · commit manual tras persistencia",
+        "Consumidor listo · topics=%s · group=%s",
         topics,
         ajustes.kafka_group,
     )
 
     try:
         while True:
-            # Recuperar lote de mensajes
             lote = await consumidor.getmany(timeout_ms=5000, max_records=100)
             if not lote:
                 await asyncio.sleep(0.5)
@@ -360,10 +316,9 @@ async def main() -> None:
                 for msg in mensajes:
                     await procesar_mensaje(pool, catalogo, msg.value, stats)
 
-            # Persistencia exitosa -> Confirmar offsets en Kafka
+            # Confirmamos en Kafka solo después de haber guardado en Postgres
             await consumidor.commit()
 
-            # Guardar auditoría del lote si hubo actividad
             if total_mensajes > 0:
                 await registrar_log_transformacion(pool, total_mensajes, stats)
                 log.info(
